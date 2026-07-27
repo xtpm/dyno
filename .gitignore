@@ -1,0 +1,12 @@
+build/
+.vs/
+.dyno-repo/
+*.user
+*.suo
+*.VC.db
+*.opendb
+*.obj
+*.pdb
+*.ilk
+*.tlog
+*.log
