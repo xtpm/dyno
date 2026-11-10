@@ -16,6 +16,7 @@
 #include <audioclientactivationparams.h>
 #include <endpointvolume.h>
 #include <audiopolicy.h>
+#include <mmreg.h>
 #include <winhttp.h>
 #include <wincodec.h>
 
@@ -73,6 +74,29 @@ constexpr UINT kMenuExit = 1003;
 
 HWND gIslandWindow = nullptr;
 HHOOK gOutsideClickHook = nullptr;
+
+// Real OS build number (GetVersionEx lies without a matching manifest entry).
+DWORD windowsBuildNumber() {
+    static const DWORD build = [] {
+        using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+        OSVERSIONINFOW info{};
+        info.dwOSVersionInfoSize = sizeof(info);
+        if (const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+            if (const auto rtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
+                    GetProcAddress(ntdll, "RtlGetVersion"))) {
+                if (rtlGetVersion(&info) == 0) return info.dwBuildNumber;
+            }
+        }
+        return DWORD{0};
+    }();
+    return build;
+}
+
+// Per-process loopback capture (AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK)
+// shipped in build 20348. Windows 10 22H2 is build 19045, so it needs a fallback.
+bool supportsProcessLoopback() {
+    return windowsBuildNumber() >= 20348;
+}
 
 LRESULT CALLBACK outsideClickHookProcedure(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION
@@ -557,11 +581,11 @@ private:
             const size_t firstBin = std::max<size_t>(
                 1,
                 static_cast<size_t>(
-                    std::floor(ranges[band].first * kFftSize / kSampleRate)));
+                    std::floor(ranges[band].first * kFftSize / static_cast<float>(sampleRate_))));
             const size_t lastBin = std::min<size_t>(
                 kFftSize / 2,
                 static_cast<size_t>(
-                    std::ceil(ranges[band].second * kFftSize / kSampleRate)));
+                    std::ceil(ranges[band].second * kFftSize / static_cast<float>(sampleRate_))));
 
             float energy = 0.0f;
             size_t binCount = 0;
@@ -619,34 +643,112 @@ private:
         return handler->waitForResult(stopToken, audioClient);
     }
 
-    HRESULT capture(DWORD processId, std::stop_token stopToken) {
-        ComPtr<IAudioClient> audioClient;
-        HRESULT result =
-            activateProcessLoopback(processId, stopToken, audioClient);
+    // Windows 10 fallback: loop back the whole default render endpoint. Other
+    // apps' audio is mixed in, so frames are only analyzed while Spotify's own
+    // session meter reports sound (see the gate in capture()).
+    static HRESULT activateEndpointLoopback(ComPtr<IAudioClient>& audioClient) {
+        ComPtr<IMMDeviceEnumerator> enumerator;
+        HRESULT result = CoCreateInstance(
+            __uuidof(MMDeviceEnumerator),
+            nullptr,
+            CLSCTX_ALL,
+            IID_PPV_ARGS(&enumerator));
         if (FAILED(result)) return result;
 
-        WAVEFORMATEX format{};
-        format.wFormatTag = WAVE_FORMAT_PCM;
-        format.nChannels = 2;
-        format.nSamplesPerSec = kSampleRate;
-        format.wBitsPerSample = 16;
-        format.nBlockAlign =
-            format.nChannels * format.wBitsPerSample / 8;
-        format.nAvgBytesPerSec =
-            format.nSamplesPerSec * format.nBlockAlign;
+        ComPtr<IMMDevice> device;
+        result = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+        if (FAILED(result)) return result;
 
-        constexpr DWORD streamFlags =
-            AUDCLNT_STREAMFLAGS_LOOPBACK
-            | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        return device->Activate(
+            __uuidof(IAudioClient),
+            CLSCTX_ALL,
+            nullptr,
+            reinterpret_cast<void**>(audioClient.ReleaseAndGetAddressOf()));
+    }
+
+    enum class SampleKind { Int16, Int32, Float32 };
+
+    static float readSample(const BYTE* frame, SampleKind kind, UINT32 channel) {
+        switch (kind) {
+        case SampleKind::Int16:
+            return static_cast<float>(
+                reinterpret_cast<const int16_t*>(frame)[channel]) / 32768.0f;
+        case SampleKind::Int32:
+            return static_cast<float>(
+                reinterpret_cast<const int32_t*>(frame)[channel]) / 2147483648.0f;
+        case SampleKind::Float32:
+            return reinterpret_cast<const float*>(frame)[channel];
+        }
+        return 0.0f;
+    }
+
+    HRESULT capture(DWORD processId, std::stop_token stopToken) {
+        const bool processLoopback = supportsProcessLoopback();
+        ComPtr<IAudioClient> audioClient;
+        HRESULT result = processLoopback
+            ? activateProcessLoopback(processId, stopToken, audioClient)
+            : activateEndpointLoopback(audioClient);
+        if (FAILED(result)) return result;
+
+        SampleKind sampleKind = SampleKind::Int16;
+        UINT32 channels = 2;
+        UINT32 frameBytes = 4;
+        DWORD streamFlags =
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+
+        WAVEFORMATEX requestedFormat{};
+        WAVEFORMATEX* mixFormat = nullptr;
+        const WAVEFORMATEX* format = &requestedFormat;
+        if (processLoopback) {
+            // The process loopback device has no mix format; ask for 16-bit
+            // stereo and let the engine convert.
+            requestedFormat.wFormatTag = WAVE_FORMAT_PCM;
+            requestedFormat.nChannels = 2;
+            requestedFormat.nSamplesPerSec = kSampleRate;
+            requestedFormat.wBitsPerSample = 16;
+            requestedFormat.nBlockAlign =
+                requestedFormat.nChannels * requestedFormat.wBitsPerSample / 8;
+            requestedFormat.nAvgBytesPerSec =
+                requestedFormat.nSamplesPerSec * requestedFormat.nBlockAlign;
+            streamFlags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+            sampleRate_ = kSampleRate;
+        } else {
+            // Endpoint loopback must use the engine's mix format as-is.
+            result = audioClient->GetMixFormat(&mixFormat);
+            if (FAILED(result)) return result;
+            format = mixFormat;
+
+            WORD tag = mixFormat->wFormatTag;
+            if (tag == WAVE_FORMAT_EXTENSIBLE
+                && mixFormat->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+                tag = static_cast<WORD>(
+                    reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mixFormat)
+                        ->SubFormat.Data1);
+            }
+            if (tag == WAVE_FORMAT_IEEE_FLOAT && mixFormat->wBitsPerSample == 32) {
+                sampleKind = SampleKind::Float32;
+            } else if (tag == WAVE_FORMAT_PCM && mixFormat->wBitsPerSample == 16) {
+                sampleKind = SampleKind::Int16;
+            } else if (tag == WAVE_FORMAT_PCM && mixFormat->wBitsPerSample == 32) {
+                sampleKind = SampleKind::Int32;
+            } else {
+                CoTaskMemFree(mixFormat);
+                return AUDCLNT_E_UNSUPPORTED_FORMAT;
+            }
+            channels = std::max<UINT32>(1, mixFormat->nChannels);
+            sampleRate_ = mixFormat->nSamplesPerSec;
+        }
+        frameBytes = format->nBlockAlign;
+
         result = audioClient->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             streamFlags,
             0,
             0,
-            &format,
+            format,
             nullptr);
+        if (mixFormat) CoTaskMemFree(mixFormat);
         if (FAILED(result)) return result;
 
         ComPtr<IAudioCaptureClient> captureClient;
@@ -673,8 +775,13 @@ private:
         std::vector<float> samples;
         samples.reserve(kFftSize * 2);
         bool captureFailed = false;
+        bool spotifyAudible = processLoopback;
+        auto lastGateCheck = std::chrono::steady_clock::time_point{};
         while (!stopToken.stop_requested()) {
-            const DWORD waitResult = WaitForSingleObject(sampleReady, 100);
+            // Endpoint loopback may not signal while the device is idle, so
+            // poll it more often instead of relying only on the event.
+            const DWORD waitResult =
+                WaitForSingleObject(sampleReady, processLoopback ? 100 : 20);
             if (waitResult == WAIT_FAILED) {
                 captureFailed = true;
                 break;
@@ -682,7 +789,15 @@ private:
             if (process && WaitForSingleObject(process, 0) == WAIT_OBJECT_0) {
                 break;
             }
-            if (waitResult != WAIT_OBJECT_0) continue;
+            if (processLoopback && waitResult != WAIT_OBJECT_0) continue;
+
+            if (!processLoopback) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - lastGateCheck > 60ms) {
+                    lastGateCheck = now;
+                    spotifyAudible = spotifySession_.peak() > 0.002f;
+                }
+            }
 
             UINT32 packetFrames = 0;
             while (SUCCEEDED(result = captureClient->GetNextPacketSize(
@@ -703,14 +818,18 @@ private:
                 }
 
                 const bool silent =
-                    (bufferFlags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-                const auto* pcm = reinterpret_cast<const int16_t*>(data);
+                    !spotifyAudible
+                    || (bufferFlags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+                const UINT32 mixChannels = std::min<UINT32>(channels, 2);
                 for (UINT32 frame = 0; frame < frameCount; ++frame) {
-                    const float mono = silent
-                        ? 0.0f
-                        : (static_cast<float>(pcm[frame * 2])
-                              + static_cast<float>(pcm[frame * 2 + 1]))
-                            / 65536.0f;
+                    float mono = 0.0f;
+                    if (!silent) {
+                        const BYTE* frameData = data + frame * frameBytes;
+                        for (UINT32 channel = 0; channel < mixChannels; ++channel) {
+                            mono += readSample(frameData, sampleKind, channel);
+                        }
+                        mono /= static_cast<float>(mixChannels);
+                    }
                     samples.push_back(mono);
                 }
                 captureClient->ReleaseBuffer(frameCount);
@@ -761,6 +880,7 @@ private:
 
     SpotifyAudioSession& spotifySession_;
     std::array<float, 5> smoothedBands_{};
+    uint32_t sampleRate_ = kSampleRate;
     mutable std::mutex mutex_;
     SpectrumSnapshot snapshot_;
     std::jthread thread_;
@@ -1884,9 +2004,32 @@ private:
         }
     };
 
+    bool fontFamilyInstalled(const wchar_t* family) const {
+        ComPtr<IDWriteFontCollection> fonts;
+        if (FAILED(textFactory_->GetSystemFontCollection(&fonts, FALSE))) {
+            return false;
+        }
+        UINT32 index = 0;
+        BOOL exists = FALSE;
+        return SUCCEEDED(fonts->FindFamilyName(family, &index, &exists))
+            && exists != FALSE;
+    }
+
+    // Segoe UI Variable ships with Windows 11 only. Windows 10 falls back to
+    // Segoe UI, which has the same metrics family and the semibold weight.
+    void resolveFontFamilies() {
+        displayFont_ = fontFamilyInstalled(L"Segoe UI Variable Display")
+            ? L"Segoe UI Variable Display"
+            : L"Segoe UI";
+        textFont_ = fontFamilyInstalled(L"Segoe UI Variable Text")
+            ? L"Segoe UI Variable Text"
+            : L"Segoe UI";
+    }
+
     HRESULT createTextFormats() {
+        resolveFontFamilies();
         HRESULT result = textFactory_->CreateTextFormat(
-            L"Segoe UI Variable Display",
+            displayFont_.c_str(),
             nullptr,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
@@ -1897,7 +2040,7 @@ private:
         if (FAILED(result)) return result;
 
         result = textFactory_->CreateTextFormat(
-            L"Segoe UI Variable Display",
+            displayFont_.c_str(),
             nullptr,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
@@ -1908,7 +2051,7 @@ private:
         if (FAILED(result)) return result;
 
         result = textFactory_->CreateTextFormat(
-            L"Segoe UI Variable Text",
+            textFont_.c_str(),
             nullptr,
             DWRITE_FONT_WEIGHT_NORMAL,
             DWRITE_FONT_STYLE_NORMAL,
@@ -1919,7 +2062,7 @@ private:
         if (FAILED(result)) return result;
 
         result = textFactory_->CreateTextFormat(
-            L"Segoe UI Variable Text",
+            textFont_.c_str(),
             nullptr,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
@@ -1930,7 +2073,7 @@ private:
         if (FAILED(result)) return result;
 
         result = textFactory_->CreateTextFormat(
-            L"Segoe UI Variable Text",
+            textFont_.c_str(),
             nullptr,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
@@ -1943,7 +2086,7 @@ private:
         tabFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
         result = textFactory_->CreateTextFormat(
-            L"Segoe UI Variable Display",
+            displayFont_.c_str(),
             nullptr,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
@@ -1954,7 +2097,7 @@ private:
         if (FAILED(result)) return result;
 
         result = textFactory_->CreateTextFormat(
-            L"Segoe UI Variable Display",
+            displayFont_.c_str(),
             nullptr,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
@@ -1967,7 +2110,7 @@ private:
         weatherHeroFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
         result = textFactory_->CreateTextFormat(
-            L"Segoe UI Variable Display",
+            displayFont_.c_str(),
             nullptr,
             DWRITE_FONT_WEIGHT_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
@@ -2266,10 +2409,80 @@ private:
                 WICBitmapPaletteTypeMedianCut))) {
             return;
         }
+        // On Windows 10, Spotify's media thumbnail is a 300x300 PNG with the
+        // cover in the top-middle and a Spotify logo below it on a transparent
+        // background. Crop to the cover so only the album art is drawn.
+        ComPtr<IWICBitmapSource> source = converter;
+        WICRect cover{};
+        ComPtr<IWICBitmapClipper> clipper;
+        if (findOpaqueCover(converter.Get(), cover)
+            && SUCCEEDED(wicFactory_->CreateBitmapClipper(&clipper))
+            && SUCCEEDED(clipper->Initialize(converter.Get(), &cover))) {
+            source = clipper;
+        }
         d2dContext_->CreateBitmapFromWicBitmap(
-            converter.Get(),
+            source.Get(),
             nullptr,
             &artworkBitmap_);
+    }
+
+    // Finds the album cover inside an artwork image that has transparent
+    // padding: the first contiguous band of mostly-opaque rows. Returns false
+    // for fully opaque images, which are already just the cover.
+    static bool findOpaqueCover(IWICBitmapSource* image, WICRect& cover) {
+        UINT width = 0;
+        UINT height = 0;
+        if (FAILED(image->GetSize(&width, &height))
+            || width < 16 || height < 16 || width > 4096 || height > 4096) {
+            return false;
+        }
+        const UINT stride = width * 4;
+        std::vector<BYTE> pixels(static_cast<size_t>(stride) * height);
+        if (FAILED(image->CopyPixels(
+                nullptr, stride, static_cast<UINT>(pixels.size()), pixels.data()))) {
+            return false;
+        }
+
+        constexpr BYTE kOpaque = 200;
+        bool hasTransparency = false;
+        int top = -1;
+        int bottom = -1;
+        UINT left = width;
+        UINT right = 0;
+        for (UINT y = 0; y < height; ++y) {
+            const BYTE* row = pixels.data() + static_cast<size_t>(y) * stride;
+            UINT opaque = 0;
+            UINT first = width;
+            UINT last = 0;
+            for (UINT x = 0; x < width; ++x) {
+                if (row[x * 4 + 3] > kOpaque) {
+                    ++opaque;
+                    first = std::min(first, x);
+                    last = x;
+                } else {
+                    hasTransparency = true;
+                }
+            }
+            const bool coverRow = opaque * 2 >= width;
+            if (coverRow && bottom < 0) {
+                if (top < 0) top = static_cast<int>(y);
+                left = std::min(left, first);
+                right = std::max(right, last);
+            } else if (!coverRow && top >= 0 && bottom < 0) {
+                bottom = static_cast<int>(y);
+            }
+        }
+        if (!hasTransparency || top < 0) return false;
+        if (bottom < 0) bottom = static_cast<int>(height);
+
+        cover.X = static_cast<INT>(left);
+        cover.Y = top;
+        cover.Width = static_cast<INT>(right - left + 1);
+        cover.Height = bottom - top;
+        // Ignore tiny or barely-cropped results; those aren't a padded cover.
+        return cover.Width >= 16 && cover.Height >= 16
+            && (cover.Width < static_cast<INT>(width)
+                || cover.Height < static_cast<INT>(height));
     }
 
     void drawAlbumArtwork(
@@ -3637,6 +3850,8 @@ private:
     ComPtr<ID2D1Bitmap1> artworkBitmap_;
     uint64_t renderedArtworkKey_ = 0;
     ComPtr<IDWriteFactory> textFactory_;
+    std::wstring displayFont_ = L"Segoe UI";
+    std::wstring textFont_ = L"Segoe UI";
     ComPtr<IDWriteTextFormat> titleFormat_;
     ComPtr<IDWriteTextFormat> mediaTitleFormat_;
     ComPtr<IDWriteTextFormat> captionFormat_;

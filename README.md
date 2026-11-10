@@ -1,4 +1,4 @@
-# Dynamic Island for Windows 11
+# Dynamic Island for Windows 10 and 11
 
 A small, dependency-free Windows overlay inspired by macOS Dynamic Island. It is
 rendered with Direct2D on a DirectComposition swap chain, so transparency and
@@ -24,9 +24,9 @@ animation stay on the GPU. When nothing is moving, the animation timer stops.
 
 Requirements:
 
-- Windows 11
-- Visual Studio 2026 (or current Preview) with **Desktop development with C++**
-- Windows 11 SDK 10.0.26100
+- Windows 10 (version 1809 or newer, including 22H2) or Windows 11
+- Visual Studio 2022 or newer (Community or Build Tools) with **Desktop development with C++**
+- Any Windows SDK 10.0.20348 or newer (the newest installed one is used)
 
 From PowerShell:
 
@@ -53,6 +53,16 @@ The Media tab intentionally selects only the Spotify desktop app’s Windows med
 session. Browser videos and other music apps are ignored. Start playing
 something in Spotify once if the title or album artwork is not immediately
 available.
+
+## Windows 10 notes
+
+- **Visualizer:** Windows 11 can capture audio from only Spotify's process.
+  Windows 10 (build 19045 and older) has no per-process capture, so the island
+  captures the default speaker output instead. It only analyzes that audio
+  while Spotify's own volume meter shows it is playing. If another app plays
+  sound at the same time as Spotify, the bars include that app too.
+- **Font:** Segoe UI Variable is a Windows 11 font. On Windows 10 the island
+  uses Segoe UI.
 
 ## Weather location
 
