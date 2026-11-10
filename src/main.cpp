@@ -19,6 +19,8 @@
 #include <mmreg.h>
 #include <winhttp.h>
 #include <wincodec.h>
+#include <dwmapi.h>
+#include <timeapi.h>
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
@@ -67,6 +69,7 @@ constexpr UINT_PTR kVisualizerTimer = 3;
 constexpr UINT kMediaChanged = WM_APP + 1;
 constexpr UINT kWeatherChanged = WM_APP + 2;
 constexpr UINT kOutsideMouseDown = WM_APP + 3;
+constexpr UINT kFrameTick = WM_APP + 4;
 
 constexpr UINT kMenuExpand = 1001;
 constexpr UINT kMenuStartup = 1002;
@@ -164,7 +167,21 @@ struct MediaSnapshot {
     }
 };
 
+struct WeatherHour {
+    int hour = 0;           // 0..23, local to the forecast location
+    int temperature = 0;
+    int weatherCode = 113;
+    int rainChance = 0;     // percent
+
+    bool operator==(const WeatherHour&) const = default;
+};
+
 struct WeatherSnapshot {
+    // Next few 3-hour forecast slots after "now".
+    std::vector<WeatherHour> hourly;
+    int sunriseMinutes = 6 * 60 + 30;   // minutes after midnight, today
+    int sunsetMinutes = 18 * 60;
+    int nextSunriseMinutes = 6 * 60 + 30;  // tomorrow
     bool loading = true;
     bool available = false;
     bool metric = false;
@@ -181,6 +198,10 @@ struct WeatherSnapshot {
 
     bool operator==(const WeatherSnapshot& other) const {
         return loading == other.loading
+            && hourly == other.hourly
+            && sunriseMinutes == other.sunriseMinutes
+            && sunsetMinutes == other.sunsetMinutes
+            && nextSunriseMinutes == other.nextSunriseMinutes
             && available == other.available
             && metric == other.metric
             && temperature == other.temperature
@@ -196,25 +217,143 @@ struct WeatherSnapshot {
     }
 };
 
+// Damped spring. Integrated in fixed sub-steps so the motion is identical at
+// 60, 144 or 240 Hz and never goes unstable on a long frame.
 struct Spring {
     float value = 0.0f;
     float velocity = 0.0f;
     float target = 0.0f;
+    float stiffness = 390.0f;
+    float dampingRatio = 0.78f;
+    // Settle threshold in this spring's own units (pixels for size, 0..1 for
+    // opacity), so small-range springs don't visibly snap at the end.
+    float epsilon = 0.02f;
+
+    static Spring make(float stiffness, float dampingRatio, float epsilon) {
+        Spring spring;
+        spring.stiffness = stiffness;
+        spring.dampingRatio = dampingRatio;
+        spring.epsilon = epsilon;
+        return spring;
+    }
 
     bool step(float dt) {
-        constexpr float stiffness = 390.0f;
-        constexpr float damping = 31.0f;
-        const float acceleration = stiffness * (target - value) - damping * velocity;
-        velocity += acceleration * dt;
-        value += velocity * dt;
+        constexpr float kSubStep = 1.0f / 480.0f;
+        const float damping = 2.0f * dampingRatio * std::sqrt(stiffness);
+        const int steps = std::clamp(
+            static_cast<int>(std::ceil(dt / kSubStep)), 1, 64);
+        const float h = dt / static_cast<float>(steps);
+        for (int index = 0; index < steps; ++index) {
+            const float acceleration =
+                stiffness * (target - value) - damping * velocity;
+            velocity += acceleration * h;
+            value += velocity * h;
+        }
 
-        if (std::abs(target - value) < 0.025f && std::abs(velocity) < 0.025f) {
+        if (std::abs(target - value) < epsilon
+            && std::abs(velocity) < epsilon * 4.0f) {
             value = target;
             velocity = 0.0f;
             return false;
         }
         return true;
     }
+
+    bool settled() const {
+        return value == target && velocity == 0.0f;
+    }
+};
+
+// Wakes the UI thread once per display refresh while something is animating.
+// WM_TIMER is quantized to the ~15.6 ms system tick and beats against a
+// 16.7 ms (or faster) refresh, which is what made animations judder.
+class VsyncClock {
+public:
+    VsyncClock(HWND target, UINT message) : target_(target), message_(message) {}
+
+    ~VsyncClock() {
+        thread_.request_stop();
+        { std::scoped_lock lock(mutex_); }  // don't lose the wake-up below
+        wake_.notify_all();
+    }
+
+    void setOutput(ComPtr<IDXGIOutput> output) {
+        std::scoped_lock lock(mutex_);
+        output_ = std::move(output);
+    }
+
+    void start() {
+        if (!thread_.joinable()) {
+            thread_ = std::jthread([this](std::stop_token stopToken) { run(stopToken); });
+        }
+        {
+            std::scoped_lock lock(mutex_);
+            running_ = true;
+        }
+        wake_.notify_all();
+    }
+
+    void stop() {
+        std::scoped_lock lock(mutex_);
+        running_ = false;
+    }
+
+    // Called by the UI thread when it has handled a tick, so ticks never
+    // pile up in the message queue ahead of input.
+    void acknowledge() {
+        pending_.store(false, std::memory_order_release);
+    }
+
+    // QPC time of the vblank that produced the latest tick.
+    int64_t lastVblank() const {
+        return lastVblank_.load(std::memory_order_acquire);
+    }
+
+private:
+    void run(std::stop_token stopToken) {
+        timeBeginPeriod(1);
+        while (!stopToken.stop_requested()) {
+            ComPtr<IDXGIOutput> output;
+            {
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [&] {
+                    return running_ || stopToken.stop_requested();
+                });
+                if (stopToken.stop_requested()) break;
+                output = output_;
+            }
+
+            bool waited = false;
+            if (output) {
+                waited = SUCCEEDED(output->WaitForVBlank());
+            }
+            if (!waited) {
+                // No output (remote session, adapter change): DWM pacing.
+                waited = SUCCEEDED(DwmFlush());
+                if (!waited) Sleep(16);
+            }
+
+            LARGE_INTEGER now{};
+            QueryPerformanceCounter(&now);
+            lastVblank_.store(now.QuadPart, std::memory_order_release);
+            if (!pending_.exchange(true, std::memory_order_acq_rel)) {
+                if (!PostMessageW(target_, message_, 0, 0)) {
+                    pending_.store(false, std::memory_order_release);
+                }
+            }
+        }
+        timeEndPeriod(1);
+    }
+
+    HWND target_;
+    UINT message_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool running_ = false;
+    ComPtr<IDXGIOutput> output_;
+    std::atomic<bool> pending_{false};
+    std::atomic<int64_t> lastVblank_{0};
+    std::jthread thread_;
 };
 
 uint32_t hashText(const std::wstring& value) {
@@ -1404,7 +1543,11 @@ private:
         result.windSpeed = jsonIntegerValue(current, windKey);
         result.weatherCode = jsonIntegerValue(current, "weatherCode", 113);
         result.condition = utf8ToWide(jsonStringValue(current, "value"));
+        while (!result.condition.empty() && iswspace(result.condition.back())) {
+            result.condition.pop_back();  // wttr.in pads some descriptions
+        }
         result.location = utf8ToWide(jsonStringValue(nearest, "value"));
+        parseForecast(forecast, result);
         if (result.condition.empty()) result.condition = L"Current conditions";
         if (result.location.empty()) {
             result.location =
@@ -1414,6 +1557,94 @@ private:
         }
         result.available = true;
         return result;
+    }
+
+    // "06:39 AM" -> minutes after midnight, or fallback.
+    static int clockToMinutes(const std::string& text, int fallback) {
+        int hour = 0;
+        int minute = 0;
+        char meridiem[3]{};
+        if (sscanf_s(text.c_str(), "%d:%d %2s", &hour, &minute, meridiem,
+                static_cast<unsigned>(sizeof(meridiem))) < 2) {
+            return fallback;
+        }
+        hour %= 12;
+        if (meridiem[0] == 'P' || meridiem[0] == 'p') hour += 12;
+        return hour * 60 + minute;
+    }
+
+    // The object ({...}) that contains position, by brace matching. wttr.in
+    // strings never contain braces, so no string-awareness is needed.
+    static std::string enclosingObject(const std::string& json, size_t position) {
+        int depth = 0;
+        size_t start = std::string::npos;
+        for (size_t index = position; index-- > 0;) {
+            if (json[index] == '}') ++depth;
+            else if (json[index] == '{') {
+                if (depth == 0) { start = index; break; }
+                --depth;
+            }
+        }
+        if (start == std::string::npos) return {};
+        depth = 0;
+        for (size_t index = start; index < json.size(); ++index) {
+            if (json[index] == '{') ++depth;
+            else if (json[index] == '}' && --depth == 0) {
+                return json.substr(start, index - start + 1);
+            }
+        }
+        return {};
+    }
+
+    // Days in "weather" each start with an "astronomy" block, followed by
+    // their 3-hourly forecast (times "0", "300" ... "2100").
+    static void parseForecast(const std::string& forecast, WeatherSnapshot& result) {
+        std::vector<size_t> dayStarts;
+        for (size_t at = forecast.find("\"astronomy\"");
+             at != std::string::npos;
+             at = forecast.find("\"astronomy\"", at + 1)) {
+            dayStarts.push_back(at);
+        }
+        if (dayStarts.empty()) return;
+
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        const int nowMinutes = now.wHour * 60 + now.wMinute;
+        const char* temperatureKey = result.metric ? "tempC" : "tempF";
+
+        for (size_t day = 0; day < dayStarts.size() && result.hourly.size() < 4; ++day) {
+            const size_t end = day + 1 < dayStarts.size()
+                ? dayStarts[day + 1]
+                : forecast.size();
+            const std::string chunk = forecast.substr(dayStarts[day], end - dayStarts[day]);
+            if (day == 0) {
+                result.sunriseMinutes =
+                    clockToMinutes(jsonStringValue(chunk, "sunrise"), result.sunriseMinutes);
+                result.sunsetMinutes =
+                    clockToMinutes(jsonStringValue(chunk, "sunset"), result.sunsetMinutes);
+            } else if (day == 1) {
+                result.nextSunriseMinutes =
+                    clockToMinutes(jsonStringValue(chunk, "sunrise"), result.nextSunriseMinutes);
+            }
+
+            for (size_t at = chunk.find("\"time\"");
+                 at != std::string::npos && result.hourly.size() < 4;
+                 at = chunk.find("\"time\"", at + 1)) {
+                const std::string hourObject = enclosingObject(chunk, at);
+                if (hourObject.empty()) continue;
+                const int time = jsonIntegerValue(hourObject, "time", -1);
+                if (time < 0) continue;
+                const int hour = time / 100;
+                // Today: only slots that start after now.
+                if (day == 0 && hour * 60 <= nowMinutes) continue;
+                result.hourly.push_back({
+                    hour,
+                    jsonIntegerValue(hourObject, temperatureKey),
+                    jsonIntegerValue(hourObject, "weatherCode", 113),
+                    jsonIntegerValue(hourObject, "chanceofrain"),
+                });
+            }
+        }
     }
 
     void publish(WeatherSnapshot next) {
@@ -1457,6 +1688,7 @@ class DynamicIslandApp {
 public:
     explicit DynamicIslandApp(HWND window)
         : window_(window),
+          vsync_(window, kFrameTick),
           spotifySpectrumCapture_(spotifyAudioSession_),
           mediaController_(window),
           weatherController_(window) {
@@ -1535,6 +1767,14 @@ public:
 
         ComPtr<IDXGIAdapter> adapter;
         if (FAILED(result = dxgiDevice->GetAdapter(&adapter))) return result;
+        adapter_ = adapter;
+
+        // Keep at most one frame queued so what's drawn is what's shown on the
+        // next refresh, instead of up to three frames behind.
+        ComPtr<IDXGIDevice1> dxgiDevice1;
+        if (SUCCEEDED(dxgiDevice.As(&dxgiDevice1))) {
+            dxgiDevice1->SetMaximumFrameLatency(1);
+        }
 
         ComPtr<IDXGIFactory2> dxgiFactory;
         if (FAILED(result = adapter->GetParent(IID_PPV_ARGS(&dxgiFactory)))) return result;
@@ -1641,12 +1881,35 @@ public:
         render();
     }
 
+    // One display refresh: advance everything by exactly the refresh time(s)
+    // that passed, then draw once.
+    void onFrameTick() {
+        vsync_.acknowledge();
+        const float dt = frameDelta();
+
+        // Resizes and fades get every refresh. The always-on visualizer is
+        // capped near 120 fps so a 240/300 Hz screen doesn't redraw the
+        // overlay hundreds of times a second just for the level bars.
+        constexpr float kVisualizerFrame = 1.0f / 120.0f;
+        visualizerElapsed_ += dt;
+        if (!animating_ && visualizerActive_
+            && visualizerElapsed_ < kVisualizerFrame - 0.0005f) {
+            return;
+        }
+
+        if (animating_) animate(dt);
+        if (visualizerActive_) updateVisualizerFrame(visualizerElapsed_);
+        visualizerElapsed_ = 0.0f;
+        render();
+
+        if (!animating_ && !visualizerActive_) {
+            vsync_.stop();
+            lastFrameVblank_ = 0;
+        }
+    }
+
     void onTimer(UINT_PTR timer) {
-        if (timer == kAnimationTimer) {
-            animate();
-        } else if (timer == kVisualizerTimer) {
-            updateVisualizerFrame();
-        } else if (timer == kStatusTimer) {
+        if (timer == kStatusTimer) {
             updateStatus();
             const float desiredWidth = expanded_ ? kExpandedWidth : compactWidth();
             if (std::abs(width_.target - desiredWidth) > 0.1f) {
@@ -2109,6 +2372,33 @@ private:
         weatherHeroFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         weatherHeroFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
+        // Weather page: big thin current temperature, like iOS Weather.
+        result = textFactory_->CreateTextFormat(
+            displayFont_.c_str(), nullptr, DWRITE_FONT_WEIGHT_LIGHT,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            50.0f, L"en-us", &weatherTempFormat_);
+        if (FAILED(result)) return result;
+        weatherTempFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        weatherTempFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+        result = textFactory_->CreateTextFormat(
+            textFont_.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            10.5f, L"en-us", &hourLabelFormat_);
+        if (FAILED(result)) return result;
+        hourLabelFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        hourLabelFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        hourLabelFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+        result = textFactory_->CreateTextFormat(
+            displayFont_.c_str(), nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            14.0f, L"en-us", &hourTempFormat_);
+        if (FAILED(result)) return result;
+        hourTempFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        hourTempFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        hourTempFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
         result = textFactory_->CreateTextFormat(
             displayFont_.c_str(),
             nullptr,
@@ -2131,35 +2421,102 @@ private:
         return S_OK;
     }
 
+    void ensureFrameClock() {
+        // Pace on the monitor the island is on (it can differ per display).
+        const HMONITOR monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTOPRIMARY);
+        if (monitor != vsyncMonitor_ && adapter_) {
+            vsyncMonitor_ = monitor;
+            ComPtr<IDXGIOutput> match;
+            ComPtr<IDXGIOutput> output;
+            for (UINT index = 0;
+                 adapter_->EnumOutputs(index, output.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND;
+                 ++index) {
+                DXGI_OUTPUT_DESC description{};
+                if (output && SUCCEEDED(output->GetDesc(&description))
+                    && description.Monitor == monitor) {
+                    match = output;
+                    break;
+                }
+            }
+            vsync_.setOutput(match);
+        }
+        vsync_.start();
+    }
+
+    static double refreshPeriodSeconds() {
+        DWM_TIMING_INFO timing{};
+        timing.cbSize = sizeof(timing);
+        LARGE_INTEGER frequency{};
+        QueryPerformanceFrequency(&frequency);
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing))
+            && timing.qpcRefreshPeriod > 0 && frequency.QuadPart > 0) {
+            return static_cast<double>(timing.qpcRefreshPeriod)
+                / static_cast<double>(frequency.QuadPart);
+        }
+        return 1.0 / 60.0;
+    }
+
+    // Time to advance this frame: a whole number of refresh periods, measured
+    // from vblank to vblank. Uniform steps are what make motion look smooth;
+    // raw wall-clock deltas carry scheduling jitter into the animation.
+    float frameDelta() {
+        const double period = refreshPeriodSeconds();
+        const int64_t vblank = vsync_.lastVblank();
+        double dt = period;
+        if (lastFrameVblank_ != 0 && vblank > lastFrameVblank_) {
+            LARGE_INTEGER frequency{};
+            QueryPerformanceFrequency(&frequency);
+            const double elapsed = static_cast<double>(vblank - lastFrameVblank_)
+                / static_cast<double>(frequency.QuadPart);
+            dt = std::clamp(std::round(elapsed / period), 1.0, 4.0) * period;
+        }
+        lastFrameVblank_ = vblank;
+        return static_cast<float>(dt);
+    }
+
     void startAnimation() {
-        lastFrame_ = std::chrono::steady_clock::now();
-        SetTimer(window_, kAnimationTimer, 8, nullptr);
+        animating_ = true;
+        updateAnimationRegion();
+        ensureFrameClock();
     }
 
     void updateVisualizerTimer() {
         const auto snapshot = mediaController_.snapshot();
         if (activeTab_ == IslandTab::Media && snapshot.available && snapshot.playing) {
-            SetTimer(window_, kVisualizerTimer, 16, nullptr);
+            visualizerActive_ = true;
+            ensureFrameClock();
         } else {
-            KillTimer(window_, kVisualizerTimer);
+            visualizerActive_ = false;
             visualizerPeak_ = 0.0f;
             visualizerBands_.fill(0.0f);
             visualizerSpectrumActive_ = false;
         }
     }
 
-    void updateVisualizerFrame() {
+    // Frame-rate independent exponential approach: the fraction of the way to
+    // the target to cover in dt, given the fraction per 60 Hz frame.
+    static float approach(float perFrameAt60Hz, float dt) {
+        return 1.0f - std::pow(1.0f - perFrameAt60Hz, dt * 60.0f);
+    }
+
+    void updateVisualizerFrame(float dt) {
         const auto snapshot = mediaController_.snapshot();
         if (activeTab_ != IslandTab::Media || !snapshot.available || !snapshot.playing) {
             updateVisualizerTimer();
-            render();
             return;
         }
 
         const auto spectrum = spotifySpectrumCapture_.snapshot();
         visualizerSpectrumActive_ = spectrum.active;
         if (spectrum.active) {
-            visualizerBands_ = spectrum.bands;
+            // The capture thread updates bands in ~11 ms steps; ease the bars
+            // toward them every refresh so they glide instead of stepping.
+            for (size_t band = 0; band < visualizerBands_.size(); ++band) {
+                const float target = spectrum.bands[band];
+                const float rate = target > visualizerBands_[band] ? 0.55f : 0.22f;
+                visualizerBands_[band] +=
+                    (target - visualizerBands_[band]) * approach(rate, dt);
+            }
             visualizerPeak_ = *std::max_element(
                 visualizerBands_.begin(),
                 visualizerBands_.end());
@@ -2169,39 +2526,68 @@ private:
                 ? std::pow(clamp01(measuredPeak), 0.55f)
                 : 0.22f + std::sin(visualizerPhase_ * 0.7f) * 0.06f;
             if (target >= visualizerPeak_) {
-                visualizerPeak_ += (target - visualizerPeak_) * 0.48f;
+                visualizerPeak_ += (target - visualizerPeak_) * approach(0.48f, dt);
             } else {
-                visualizerPeak_ *= 0.86f;
+                visualizerPeak_ *= std::pow(0.86f, dt * 60.0f);
             }
         }
-        visualizerPhase_ += 0.16f + visualizerPeak_ * 0.13f;
-        render();
+        visualizerPhase_ += (0.16f + visualizerPeak_ * 0.13f) * dt * 60.0f;
+
+        // Cross-fade the bar color to the new album over ~0.4 s.
+        const float blend = approach(0.12f, dt);
+        albumColor_.r += (albumColorTarget_.r - albumColor_.r) * blend;
+        albumColor_.g += (albumColorTarget_.g - albumColor_.g) * blend;
+        albumColor_.b += (albumColorTarget_.b - albumColor_.b) * blend;
     }
 
-    void animate() {
-        const auto now = std::chrono::steady_clock::now();
-        const float dt = std::clamp(
-            std::chrono::duration<float>(now - lastFrame_).count(),
-            0.001f,
-            0.033f);
-        lastFrame_ = now;
-
-        const float previousWidth = width_.value;
-        const float previousHeight = height_.value;
+    void animate(float dt) {
         const bool widthMoving = width_.step(dt);
         const bool heightMoving = height_.step(dt);
         const bool hoverMoving = hover_.step(dt);
         const bool tabMoving = tabIndicator_.step(dt);
         const bool contentMoving = contentOpacity_.step(dt);
-        if (std::abs(width_.value - previousWidth) > 0.001f
-            || std::abs(height_.value - previousHeight) > 0.001f) {
-            updateWindowRegion();
-        }
-        render();
 
         if (!widthMoving && !heightMoving && !hoverMoving && !tabMoving && !contentMoving) {
-            KillTimer(window_, kAnimationTimer);
+            animating_ = false;
+            // Settled: restore the exact rounded hit region.
+            animationRegionSet_ = false;
+            updateWindowRegion();
+        } else {
+            updateAnimationRegion();
         }
+    }
+
+    // While the island is resizing, the window region (used for click-through)
+    // must not clip the drawing. A region applies immediately but the frame
+    // shows on the next refresh, so a per-frame rounded region visibly cuts
+    // the edges. Use one generous rectangle covering where the island is and
+    // is heading, and only grow it when the island outgrows it.
+    void updateAnimationRegion() {
+        constexpr float kMargin = 14.0f;
+        const float scale = static_cast<float>(GetDpiForWindow(window_)) / 96.0f;
+        const float width = std::max(width_.value, width_.target) + kMargin * 2.0f;
+        const float height = std::max(height_.value, height_.target) + kMargin;
+        const float left = (kCanvasWidth - width) * 0.5f;
+        const RECT wanted{
+            static_cast<LONG>(std::floor(left * scale)),
+            0,
+            static_cast<LONG>(std::ceil((left + width) * scale)),
+            static_cast<LONG>(std::ceil((kTopInset + height) * scale)),
+        };
+        if (animationRegionSet_
+            && wanted.left >= animationRegion_.left
+            && wanted.right <= animationRegion_.right
+            && wanted.bottom <= animationRegion_.bottom) {
+            return;
+        }
+        const HRGN region = CreateRectRgn(wanted.left, wanted.top, wanted.right, wanted.bottom);
+        if (!region) return;
+        if (SetWindowRgn(window_, region, FALSE) == 0) {
+            DeleteObject(region);
+            return;
+        }
+        animationRegion_ = wanted;
+        animationRegionSet_ = true;
     }
 
     float compactWidth() const {
@@ -2230,6 +2616,7 @@ private:
     }
 
     void updateWindowRegion() {
+        animationRegionSet_ = false;
         const float scale =
             static_cast<float>(GetDpiForWindow(window_)) / 96.0f;
         const auto rect = islandRect();
@@ -2344,12 +2731,13 @@ private:
     }
 
     FloatRect weatherRefreshRect() const {
+        // Bottom-right of the sky card, at the end of the details row.
         const auto rect = islandRect();
         return {
-            rect.right - 70.0f,
-            rect.top + 12.0f,
-            rect.right - 42.0f,
-            rect.top + 40.0f,
+            rect.right - 52.0f,
+            rect.top + 140.0f,
+            rect.right - 30.0f,
+            rect.top + 162.0f,
         };
     }
 
@@ -2377,7 +2765,10 @@ private:
         if (snapshot.artworkKey == renderedArtworkKey_) return;
         renderedArtworkKey_ = snapshot.artworkKey;
         artworkBitmap_.Reset();
-        if (!wicFactory_ || !snapshot.artwork || snapshot.artwork->empty()) return;
+        if (!wicFactory_ || !snapshot.artwork || snapshot.artwork->empty()) {
+            hasAlbumColor_ = false;
+            return;
+        }
 
         ComPtr<IWICStream> stream;
         if (FAILED(wicFactory_->CreateStream(&stream))) return;
@@ -2420,10 +2811,148 @@ private:
             && SUCCEEDED(clipper->Initialize(converter.Get(), &cover))) {
             source = clipper;
         }
+        D2D1_COLOR_F albumColor{};
+        if (extractAlbumColor(source.Get(), albumColor)) {
+            albumColorTarget_ = albumColor;
+            // First song, or nothing animating: switch at once. Otherwise the
+            // visualizer fades to it (see updateVisualizerFrame).
+            if (!hasAlbumColor_ || !visualizerActive_) albumColor_ = albumColor;
+            hasAlbumColor_ = true;
+        }
         d2dContext_->CreateBitmapFromWicBitmap(
             source.Get(),
             nullptr,
             &artworkBitmap_);
+    }
+
+    // Picks the color that best represents the cover, for the visualizer.
+    // Pixels are grouped into hue buckets weighted by how vivid they are; the
+    // strongest bucket's average wins. Greyscale covers fall back to a soft
+    // tint of their overall tone. The result is adjusted to read well on the
+    // black island.
+    static bool extractAlbumColor(IWICBitmapSource* image, D2D1_COLOR_F& color) {
+        UINT width = 0;
+        UINT height = 0;
+        if (FAILED(image->GetSize(&width, &height)) || width == 0 || height == 0
+            || width > 4096 || height > 4096) {
+            return false;
+        }
+        const UINT stride = width * 4;
+        std::vector<BYTE> pixels(static_cast<size_t>(stride) * height);
+        if (FAILED(image->CopyPixels(
+                nullptr, stride, static_cast<UINT>(pixels.size()), pixels.data()))) {
+            return false;
+        }
+
+        constexpr int kBuckets = 24;
+        struct Bucket { double weight = 0, r = 0, g = 0, b = 0; };
+        std::array<Bucket, kBuckets> buckets{};
+        double allR = 0, allG = 0, allB = 0, allCount = 0;
+        const UINT step = std::max<UINT>(1, std::max(width, height) / 96);
+
+        for (UINT y = 0; y < height; y += step) {
+            for (UINT x = 0; x < width; x += step) {
+                const BYTE* pixel = pixels.data() + static_cast<size_t>(y) * stride + x * 4;
+                const float alpha = pixel[3] / 255.0f;
+                if (alpha < 0.5f) continue;
+                // PBGRA: un-premultiply.
+                const float b = pixel[0] / 255.0f / alpha;
+                const float g = pixel[1] / 255.0f / alpha;
+                const float r = pixel[2] / 255.0f / alpha;
+                allR += r; allG += g; allB += b; allCount += 1;
+
+                const float maximum = std::max({r, g, b});
+                const float minimum = std::min({r, g, b});
+                const float chroma = maximum - minimum;
+                if (maximum < 0.18f || chroma < 0.12f) continue;  // too dark / grey
+
+                float hue;
+                if (maximum == r) hue = std::fmod((g - b) / chroma, 6.0f);
+                else if (maximum == g) hue = (b - r) / chroma + 2.0f;
+                else hue = (r - g) / chroma + 4.0f;
+                hue = hue < 0.0f ? hue + 6.0f : hue;
+                const int index = std::min(
+                    kBuckets - 1, static_cast<int>(hue / 6.0f * kBuckets));
+
+                const float saturation = chroma / maximum;
+                // Favor vivid, reasonably bright pixels over muddy ones.
+                const double weight = saturation * saturation * (0.35 + maximum);
+                auto& bucket = buckets[static_cast<size_t>(index)];
+                bucket.weight += weight;
+                bucket.r += r * weight; bucket.g += g * weight; bucket.b += b * weight;
+            }
+        }
+        if (allCount == 0) return false;
+
+        // Neighboring buckets count toward a peak, so a gradient across a
+        // bucket boundary isn't split in two.
+        int best = -1;
+        double bestScore = 0;
+        double colorfulWeight = 0;
+        for (int index = 0; index < kBuckets; ++index) {
+            colorfulWeight += buckets[static_cast<size_t>(index)].weight;
+            const double score = buckets[static_cast<size_t>(index)].weight
+                + 0.5 * buckets[static_cast<size_t>((index + 1) % kBuckets)].weight
+                + 0.5 * buckets[static_cast<size_t>((index + kBuckets - 1) % kBuckets)].weight;
+            if (score > bestScore) { bestScore = score; best = index; }
+        }
+
+        float r, g, b;
+        // Colorful pixels need to be a meaningful share of the cover; a few
+        // stray tinted pixels on a black-and-white photo shouldn't win.
+        const bool colorful = best >= 0 && colorfulWeight / allCount > 0.015;
+        if (colorful) {
+            const auto& bucket = buckets[static_cast<size_t>(best)];
+            r = static_cast<float>(bucket.r / bucket.weight);
+            g = static_cast<float>(bucket.g / bucket.weight);
+            b = static_cast<float>(bucket.b / bucket.weight);
+        } else {
+            r = static_cast<float>(allR / allCount);
+            g = static_cast<float>(allG / allCount);
+            b = static_cast<float>(allB / allCount);
+        }
+
+        // To HSL, clamp into a range that glows on black, back to RGB.
+        const float maximum = std::max({r, g, b});
+        const float minimum = std::min({r, g, b});
+        float lightness = (maximum + minimum) * 0.5f;
+        float saturation = 0.0f;
+        float hue = 0.0f;
+        const float chroma = maximum - minimum;
+        if (chroma > 0.0001f) {
+            saturation = chroma / (1.0f - std::abs(2.0f * lightness - 1.0f));
+            if (maximum == r) hue = std::fmod((g - b) / chroma, 6.0f);
+            else if (maximum == g) hue = (b - r) / chroma + 2.0f;
+            else hue = (r - g) / chroma + 4.0f;
+            hue = (hue < 0.0f ? hue + 6.0f : hue) / 6.0f;
+        }
+        if (colorful) {
+            saturation = std::clamp(saturation * 1.15f, 0.45f, 0.92f);
+            lightness = std::clamp(lightness, 0.58f, 0.72f);
+        } else {
+            // Keep a hint of the cover's tone (sepia, cool grey...).
+            saturation = std::min(saturation, 0.25f);
+            lightness = 0.80f;
+        }
+
+        const auto hueToRgb = [](float p, float q, float t) {
+            if (t < 0.0f) t += 1.0f;
+            if (t > 1.0f) t -= 1.0f;
+            if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
+            if (t < 1.0f / 2.0f) return q;
+            if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+            return p;
+        };
+        const float q = lightness < 0.5f
+            ? lightness * (1.0f + saturation)
+            : lightness + saturation - lightness * saturation;
+        const float p = 2.0f * lightness - q;
+        color = D2D1::ColorF(
+            hueToRgb(p, q, hue + 1.0f / 3.0f),
+            hueToRgb(p, q, hue),
+            hueToRgb(p, q, hue - 1.0f / 3.0f),
+            1.0f);
+        return true;
     }
 
     // Finds the album cover inside an artwork image that has transparent
@@ -2568,7 +3097,7 @@ private:
 
     void drawVisualizer(
         const FloatRect& bounds,
-        uint32_t accentSeed,
+        uint32_t accentSeed,  // fallback when there is no artwork color
         float opacity) {
         constexpr int barCount = 5;
         constexpr float barWidth = 3.0f;
@@ -2578,7 +3107,8 @@ private:
             bounds.left + ((bounds.right - bounds.left) - totalWidth) * 0.5f;
         const float centerY = (bounds.top + bounds.bottom) * 0.5f;
         const float maximumHeight = bounds.bottom - bounds.top;
-        const D2D1_COLOR_F accent = accentFromSeed(accentSeed);
+        const D2D1_COLOR_F accent =
+            hasAlbumColor_ ? albumColor_ : accentFromSeed(accentSeed);
 
         for (int index = 0; index < barCount; ++index) {
             const float wave = 0.35f + 0.65f * std::abs(std::sin(
@@ -3046,7 +3576,47 @@ private:
         }
     }
 
-    void drawWeatherIcon(D2D1_POINT_2F center, int code, float opacity) {
+    // Draws the icon scaled about its center (1.0 = the ~60 px hero size).
+    void drawWeatherIcon(
+        D2D1_POINT_2F center,
+        int code,
+        float opacity,
+        bool night = false,
+        float scale = 1.0f) {
+        D2D1_MATRIX_3X2_F previous{};
+        d2dContext_->GetTransform(&previous);
+        d2dContext_->SetTransform(
+            D2D1::Matrix3x2F::Scale(scale, scale, center) * previous);
+        drawWeatherIconShape(center, code, opacity, night);
+        d2dContext_->SetTransform(previous);
+    }
+
+    void drawMoon(D2D1_POINT_2F center, float radius, float opacity) {
+        ComPtr<ID2D1EllipseGeometry> disc;
+        ComPtr<ID2D1EllipseGeometry> bite;
+        ComPtr<ID2D1PathGeometry> crescent;
+        ComPtr<ID2D1GeometrySink> sink;
+        ComPtr<ID2D1SolidColorBrush> moon;
+        d2dContext_->CreateSolidColorBrush(
+            D2D1::ColorF(0.97f, 0.95f, 0.84f, opacity), &moon);
+        if (SUCCEEDED(d2dFactory_->CreateEllipseGeometry(
+                D2D1::Ellipse(center, radius, radius), &disc))
+            && SUCCEEDED(d2dFactory_->CreateEllipseGeometry(
+                D2D1::Ellipse(
+                    D2D1::Point2F(center.x + radius * 0.55f, center.y - radius * 0.35f),
+                    radius * 0.85f,
+                    radius * 0.85f),
+                &bite))
+            && SUCCEEDED(d2dFactory_->CreatePathGeometry(&crescent))
+            && SUCCEEDED(crescent->Open(&sink))
+            && SUCCEEDED(disc->CombineWithGeometry(
+                bite.Get(), D2D1_COMBINE_MODE_EXCLUDE, nullptr, sink.Get()))
+            && SUCCEEDED(sink->Close())) {
+            d2dContext_->FillGeometry(crescent.Get(), moon.Get());
+        }
+    }
+
+    void drawWeatherIconShape(D2D1_POINT_2F center, int code, float opacity, bool night) {
         const bool clear = code == 113;
         const bool partlyCloudy = code == 116;
         const bool rain = isRainCode(code);
@@ -3068,7 +3638,12 @@ private:
             D2D1::ColorF(0.34f, 0.64f, 1.0f, opacity),
             &precipitation);
 
-        if (clear || partlyCloudy) {
+        if ((clear || partlyCloudy) && night) {
+            const D2D1_POINT_2F moonCenter = partlyCloudy
+                ? D2D1::Point2F(center.x - 12.0f, center.y - 10.0f)
+                : center;
+            drawMoon(moonCenter, clear ? 21.0f : 16.0f, opacity);
+        } else if (clear || partlyCloudy) {
             const D2D1_POINT_2F sunCenter = partlyCloudy
                 ? D2D1::Point2F(center.x - 13.0f, center.y - 10.0f)
                 : center;
@@ -3140,241 +3715,254 @@ private:
         }
     }
 
+    static bool isNightAt(int minutes, const WeatherSnapshot& weather) {
+        return minutes < weather.sunriseMinutes || minutes >= weather.sunsetMinutes;
+    }
+
+    // Sky gradient (top, bottom) for the conditions and time of day.
+    static std::pair<D2D1_COLOR_F, D2D1_COLOR_F> skyColors(int code, bool night) {
+        uint32_t top;
+        uint32_t bottom;
+        if (code == 200 || code == 386 || code == 389 || code == 392 || code == 395) {
+            top = 0x231F35u; bottom = 0x3B3553u;                 // thunder
+        } else if (isSnowCode(code)) {
+            top = night ? 0x26344Au : 0x5C7591u;
+            bottom = night ? 0x3B4C66u : 0x8DA3BBu;              // snow
+        } else if (isRainCode(code)) {
+            top = night ? 0x18212Eu : 0x2D3B50u;
+            bottom = night ? 0x29384Bu : 0x46586Fu;              // rain
+        } else if (code == 143 || code == 248 || code == 260) {
+            top = night ? 0x272C33u : 0x58626Du;
+            bottom = night ? 0x3A4049u : 0x7C8691u;              // fog
+        } else if (code == 113) {
+            top = night ? 0x0A1430u : 0x2A6BC6u;
+            bottom = night ? 0x1E2C59u : 0x5196E4u;              // clear
+        } else if (code == 116) {
+            top = night ? 0x111C38u : 0x3570B8u;
+            bottom = night ? 0x293860u : 0x6C9BD2u;              // partly cloudy
+        } else {
+            top = night ? 0x1A2230u : 0x4C6177u;
+            bottom = night ? 0x2C3647u : 0x70849Au;              // cloudy
+        }
+        return {colorFromHex(top), colorFromHex(bottom)};
+    }
+
+    static std::wstring hourLabel(int hour) {
+        const int twelve = hour % 12 == 0 ? 12 : hour % 12;
+        return std::format(L"{}{}", twelve, hour < 12 ? L"AM" : L"PM");
+    }
+
+    static std::wstring clockLabel(int minutes) {
+        const int hour = (minutes / 60) % 24;
+        const int twelve = hour % 12 == 0 ? 12 : hour % 12;
+        return std::format(L"{}:{:02}", twelve, minutes % 60);
+    }
+
+    void drawText(
+        const std::wstring& text,
+        IDWriteTextFormat* format,
+        const D2D1_RECT_F& bounds,
+        ID2D1Brush* brush) {
+        d2dContext_->DrawTextW(
+            text.c_str(),
+            static_cast<UINT32>(text.size()),
+            format,
+            bounds,
+            brush,
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    // Weather page: a sky card that follows the conditions and time of day,
+    // the current temperature on the left, the next hours on the right, and
+    // details along the bottom.
     void drawWeatherPage(float opacity) {
         const auto rect = islandRect();
         const auto weather = weatherController_.snapshot();
-        const D2D1_COLOR_F weatherAccent =
-            colorFromHex(weather.weatherCode == 113 ? 0xFFB52Eu : 0x72A7FFu);
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        const int nowMinutes = now.wHour * 60 + now.wMinute;
+        const bool night = isNightAt(nowMinutes, weather);
+
+        // Sky card.
+        const FloatRect card{
+            rect.left + 6.0f,
+            rect.top + 6.0f,
+            rect.right - 6.0f,
+            rect.bottom - 6.0f,
+        };
+        const float cardRadius = std::max(8.0f, cornerRadius() - 6.0f);
+        const auto [skyTop, skyBottom] = skyColors(
+            weather.available ? weather.weatherCode : 119, night);
+        const D2D1_GRADIENT_STOP stops[] = {
+            {0.0f, D2D1::ColorF(skyTop.r, skyTop.g, skyTop.b, opacity)},
+            {1.0f, D2D1::ColorF(skyBottom.r, skyBottom.g, skyBottom.b, opacity)},
+        };
+        ComPtr<ID2D1GradientStopCollection> stopCollection;
+        ComPtr<ID2D1LinearGradientBrush> sky;
+        if (SUCCEEDED(d2dContext_->CreateGradientStopCollection(
+                stops, ARRAYSIZE(stops), &stopCollection))) {
+            d2dContext_->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties(
+                    D2D1::Point2F(card.left, card.top),
+                    D2D1::Point2F(card.left + 40.0f, card.bottom)),
+                stopCollection.Get(),
+                &sky);
+        }
+        if (sky) {
+            d2dContext_->FillRoundedRectangle(
+                D2D1::RoundedRect(card, cardRadius, cardRadius),
+                sky.Get());
+        }
 
         ComPtr<ID2D1SolidColorBrush> primary;
         ComPtr<ID2D1SolidColorBrush> secondary;
-        ComPtr<ID2D1SolidColorBrush> muted;
-        ComPtr<ID2D1SolidColorBrush> heroCard;
-        ComPtr<ID2D1SolidColorBrush> metricTray;
-        ComPtr<ID2D1SolidColorBrush> accent;
-        ComPtr<ID2D1SolidColorBrush> accentSurface;
-        d2dContext_->CreateSolidColorBrush(
-            D2D1::ColorF(0.97f, 0.98f, 1.0f, opacity),
-            &primary);
-        d2dContext_->CreateSolidColorBrush(
-            D2D1::ColorF(0.62f, 0.65f, 0.70f, opacity),
-            &secondary);
-        d2dContext_->CreateSolidColorBrush(
-            D2D1::ColorF(0.50f, 0.53f, 0.59f, opacity),
-            &muted);
-        d2dContext_->CreateSolidColorBrush(
-            D2D1::ColorF(
-                weatherAccent.r,
-                weatherAccent.g,
-                weatherAccent.b,
-                0.10f * opacity),
-            &heroCard);
-        d2dContext_->CreateSolidColorBrush(
-            D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.065f * opacity),
-            &metricTray);
-        d2dContext_->CreateSolidColorBrush(
-            D2D1::ColorF(
-                weatherAccent.r,
-                weatherAccent.g,
-                weatherAccent.b,
-                opacity),
-            &accent);
-        d2dContext_->CreateSolidColorBrush(
-            D2D1::ColorF(
-                weatherAccent.r,
-                weatherAccent.g,
-                weatherAccent.b,
-                0.09f * opacity),
-            &accentSurface);
+        ComPtr<ID2D1SolidColorBrush> faint;
+        ComPtr<ID2D1SolidColorBrush> rainBrush;
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, opacity), &primary);
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.72f * opacity), &secondary);
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.16f * opacity), &faint);
+        d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0.62f, 0.86f, 1.0f, opacity), &rainBrush);
 
-        const auto refresh = weatherRefreshRect();
-        d2dContext_->FillRoundedRectangle(
-            D2D1::RoundedRect(refresh, 14.0f, 14.0f),
-            metricTray.Get());
-        const std::wstring refreshText = L"↻";
-        d2dContext_->DrawTextW(
-            refreshText.c_str(),
-            1,
-            tabFormat_.Get(),
-            refresh,
-            secondary.Get());
+        const float left = card.left + 16.0f;
+        const float right = card.right - 22.0f;  // clear of the page dots
 
-        const FloatRect hero{
-            rect.left + 14.0f,
-            rect.top + 14.0f,
-            rect.left + 160.0f,
-            rect.bottom - 12.0f,
-        };
-        d2dContext_->FillRoundedRectangle(
-            D2D1::RoundedRect(hero, 20.0f, 20.0f),
-            heroCard.Get());
-
+        // Location with a small navigation arrow.
         const std::wstring location =
             weather.available ? weather.location : L"Local weather";
-        d2dContext_->FillEllipse(
-            D2D1::Ellipse(
-                D2D1::Point2F(hero.left + 16.0f, hero.top + 17.0f),
-                3.0f,
-                3.0f),
-            accent.Get());
-        d2dContext_->DrawTextW(
-            location.c_str(),
-            static_cast<UINT32>(location.size()),
+        {
+            ComPtr<ID2D1PathGeometry> arrow;
+            ComPtr<ID2D1GeometrySink> sink;
+            if (SUCCEEDED(d2dFactory_->CreatePathGeometry(&arrow))
+                && SUCCEEDED(arrow->Open(&sink))) {
+                const float x = left;
+                const float y = card.top + 16.0f;
+                sink->BeginFigure(D2D1::Point2F(x + 8.0f, y - 4.0f), D2D1_FIGURE_BEGIN_FILLED);
+                const D2D1_POINT_2F points[] = {
+                    D2D1::Point2F(x + 4.6f, y + 4.5f),
+                    D2D1::Point2F(x + 3.6f, y + 0.9f),
+                    D2D1::Point2F(x, y - 0.1f),
+                };
+                sink->AddLines(points, ARRAYSIZE(points));
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                d2dContext_->FillGeometry(arrow.Get(), primary.Get());
+            }
+        }
+        drawText(
+            location,
             smallFormat_.Get(),
-            D2D1::RectF(
-                hero.left + 26.0f,
-                hero.top + 9.0f,
-                hero.right - 12.0f,
-                hero.top + 29.0f),
-            primary.Get(),
-            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            D2D1::RectF(left + 13.0f, card.top + 8.0f, card.left + 150.0f, card.top + 24.0f),
+            primary.Get());
 
         if (!weather.available) {
             const std::wstring heading =
-                weather.loading ? L"Loading local weather…" : L"Weather unavailable";
+                weather.loading ? L"Loading weather…" : L"Weather unavailable";
             const std::wstring detail =
                 weather.loading ? L"Getting the latest conditions" : weather.error;
-            d2dContext_->DrawTextW(
-                heading.c_str(),
-                static_cast<UINT32>(heading.size()),
-                titleFormat_.Get(),
-                D2D1::RectF(
-                    rect.left + 175.0f,
-                    rect.top + 62.0f,
-                    rect.right - 30.0f,
-                    rect.top + 86.0f),
+            drawText(heading, titleFormat_.Get(),
+                D2D1::RectF(left, card.top + 58.0f, right, card.top + 80.0f),
                 primary.Get());
-            d2dContext_->DrawTextW(
-                detail.c_str(),
-                static_cast<UINT32>(detail.size()),
-                captionFormat_.Get(),
-                D2D1::RectF(
-                    rect.left + 175.0f,
-                    rect.top + 91.0f,
-                    rect.right - 30.0f,
-                    rect.top + 126.0f),
+            drawText(detail, captionFormat_.Get(),
+                D2D1::RectF(left, card.top + 82.0f, right, card.top + 100.0f),
                 secondary.Get());
+            drawWeatherRefresh(opacity, secondary.Get(), faint.Get());
             return;
         }
 
-        const D2D1_POINT_2F iconCenter =
-            D2D1::Point2F((hero.left + hero.right) * 0.5f, hero.top + 55.0f);
-        d2dContext_->FillEllipse(
-            D2D1::Ellipse(iconCenter, 32.0f, 32.0f),
-            accentSurface.Get());
-        drawWeatherIcon(
-            iconCenter,
-            weather.weatherCode,
-            opacity);
-
-        const std::wstring temperature = std::format(L"{}°", weather.temperature);
-        d2dContext_->DrawTextW(
-            temperature.c_str(),
-            static_cast<UINT32>(temperature.size()),
-            weatherHeroFormat_.Get(),
-            D2D1::RectF(
-                hero.left + 8.0f,
-                hero.top + 82.0f,
-                hero.right - 8.0f,
-                hero.top + 126.0f),
+        // Current conditions, left column.
+        drawText(
+            std::format(L"{}°", weather.temperature),
+            weatherTempFormat_.Get(),
+            D2D1::RectF(left - 3.0f, card.top + 22.0f, card.left + 150.0f, card.top + 84.0f),
             primary.Get());
-        const std::wstring units = weather.metric ? L"C" : L"F";
-        d2dContext_->DrawTextW(
-            units.c_str(),
-            static_cast<UINT32>(units.size()),
-            smallFormat_.Get(),
-            D2D1::RectF(
-                hero.right - 34.0f,
-                hero.top + 90.0f,
-                hero.right - 12.0f,
-                hero.top + 108.0f),
-            secondary.Get());
-        d2dContext_->DrawTextW(
-            weather.condition.c_str(),
-            static_cast<UINT32>(weather.condition.size()),
-            tabFormat_.Get(),
-            D2D1::RectF(
-                hero.left + 12.0f,
-                hero.bottom - 27.0f,
-                hero.right - 12.0f,
-                hero.bottom - 7.0f),
-            primary.Get(),
-            D2D1_DRAW_TEXT_OPTIONS_CLIP);
-
-        const std::wstring todayLabel = L"TODAY";
-        d2dContext_->DrawTextW(
-            todayLabel.c_str(),
-            static_cast<UINT32>(todayLabel.size()),
-            smallFormat_.Get(),
-            D2D1::RectF(
-                rect.left + 175.0f,
-                rect.top + 18.0f,
-                rect.right - 80.0f,
-                rect.top + 36.0f),
-            accent.Get());
-        const std::wstring range =
-            std::format(L"High {}°   Low {}°", weather.high, weather.low);
-        d2dContext_->DrawTextW(
-            range.c_str(),
-            static_cast<UINT32>(range.size()),
+        drawText(
+            weather.condition,
             titleFormat_.Get(),
-            D2D1::RectF(
-                rect.left + 175.0f,
-                rect.top + 39.0f,
-                rect.right - 31.0f,
-                rect.top + 61.0f),
+            D2D1::RectF(left, card.top + 86.0f, card.left + 150.0f, card.top + 104.0f),
+            primary.Get());
+        drawText(
+            std::format(L"H:{}°  L:{}°", weather.high, weather.low),
+            captionFormat_.Get(),
+            D2D1::RectF(left, card.top + 105.0f, card.left + 150.0f, card.top + 121.0f),
             secondary.Get());
 
-        const std::wstring values[] = {
-            std::format(L"{}°", weather.feelsLike),
-            std::format(L"{}%", weather.humidity),
-            std::format(
-                L"{} {}",
-                weather.windSpeed,
-                weather.metric ? L"km/h" : L"mph"),
-        };
-        static constexpr const wchar_t* labels[] = {
-            L"Feels like", L"Humidity", L"Wind",
-        };
-        for (int index = 0; index < 3; ++index) {
-            const float top =
-                rect.top + 67.0f + static_cast<float>(index) * 38.0f;
-            const FloatRect row{
-                rect.left + 173.0f,
-                top,
-                rect.right - 29.0f,
-                top + 31.0f,
-            };
-            d2dContext_->FillRoundedRectangle(
-                D2D1::RoundedRect(row, 11.0f, 11.0f),
-                metricTray.Get());
-            d2dContext_->FillEllipse(
-                D2D1::Ellipse(
-                    D2D1::Point2F(row.left + 14.0f, (row.top + row.bottom) * 0.5f),
-                    2.2f,
-                    2.2f),
-                accent.Get());
-            d2dContext_->DrawTextW(
-                labels[index],
-                static_cast<UINT32>(wcslen(labels[index])),
-                captionFormat_.Get(),
-                D2D1::RectF(
-                    row.left + 25.0f,
-                    row.top + 7.0f,
-                    row.right - 72.0f,
-                    row.bottom - 5.0f),
-                muted.Get());
-            d2dContext_->DrawTextW(
-                values[index].c_str(),
-                static_cast<UINT32>(values[index].size()),
-                tabFormat_.Get(),
-                D2D1::RectF(
-                    row.right - 70.0f,
-                    row.top + 4.0f,
-                    row.right - 8.0f,
-                    row.bottom - 4.0f),
+        // Hourly strip: Now + the next forecast slots.
+        struct Column { std::wstring label; int temperature; int code; int rain; bool night; };
+        std::vector<Column> columns;
+        columns.push_back({L"Now", weather.temperature, weather.weatherCode, 0, night});
+        for (const auto& hour : weather.hourly) {
+            if (columns.size() >= 5) break;
+            columns.push_back({
+                hourLabel(hour.hour),
+                hour.temperature,
+                hour.weatherCode,
+                hour.rainChance,
+                isNightAt(hour.hour * 60, weather),
+            });
+        }
+        const float stripLeft = card.left + 152.0f;
+        const float columnWidth = (right - stripLeft) / 5.0f;
+        for (size_t index = 0; index < columns.size(); ++index) {
+            const auto& column = columns[index];
+            const float x = stripLeft + columnWidth * static_cast<float>(index);
+            const float centerX = x + columnWidth * 0.5f;
+            drawText(
+                column.label,
+                index == 0 ? tabFormat_.Get() : hourLabelFormat_.Get(),
+                D2D1::RectF(x, card.top + 18.0f, x + columnWidth, card.top + 34.0f),
+                index == 0 ? primary.Get() : secondary.Get());
+            drawWeatherIcon(
+                D2D1::Point2F(centerX, card.top + 56.0f),
+                column.code,
+                opacity,
+                column.night,
+                0.40f);
+            if (column.rain >= 20) {
+                drawText(
+                    std::format(L"{}%", column.rain),
+                    hourLabelFormat_.Get(),
+                    D2D1::RectF(x, card.top + 74.0f, x + columnWidth, card.top + 88.0f),
+                    rainBrush.Get());
+            }
+            drawText(
+                std::format(L"{}°", column.temperature),
+                hourTempFormat_.Get(),
+                D2D1::RectF(x, card.top + 88.0f, x + columnWidth, card.top + 108.0f),
                 primary.Get());
         }
+
+        // Divider and details row.
+        d2dContext_->FillRectangle(
+            D2D1::RectF(left, card.top + 130.0f, right, card.top + 131.0f),
+            faint.Get());
+        const bool beforeSunrise = nowMinutes < weather.sunriseMinutes;
+        const bool beforeSunset = nowMinutes < weather.sunsetMinutes;
+        const std::wstring sun = beforeSunrise
+            ? L"Sunrise " + clockLabel(weather.sunriseMinutes)
+            : beforeSunset
+                ? L"Sunset " + clockLabel(weather.sunsetMinutes)
+                : L"Sunrise " + clockLabel(weather.nextSunriseMinutes);
+        const std::wstring details = std::format(
+            L"Feels {}°   ·   Humidity {}%   ·   Wind {} {}   ·   {}",
+            weather.feelsLike,
+            weather.humidity,
+            weather.windSpeed,
+            weather.metric ? L"km/h" : L"mph",
+            sun);
+        drawText(
+            details,
+            captionFormat_.Get(),
+            D2D1::RectF(left, card.top + 137.0f, right - 26.0f, card.top + 155.0f),
+            secondary.Get());
+        drawWeatherRefresh(opacity, secondary.Get(), faint.Get());
+    }
+
+    void drawWeatherRefresh(float, ID2D1Brush* text, ID2D1Brush* surface) {
+        const auto refresh = weatherRefreshRect();
+        d2dContext_->FillRoundedRectangle(
+            D2D1::RoundedRect(refresh, 10.0f, 10.0f),
+            surface);
+        drawText(L"↻", tabFormat_.Get(), refresh, text);
     }
 
     static std::wstring formatMediaTime(int64_t seconds, bool negative = false) {
@@ -3822,17 +4410,33 @@ private:
     std::array<float, 5> visualizerBands_{};
     bool visualizerSpectrumActive_ = false;
     std::wstring timeText_ = L"--:--";
-    Spring width_;
-    Spring height_;
-    Spring hover_;
-    Spring tabIndicator_;
-    Spring contentOpacity_;
+    // Size: slightly springy, like the iPhone island. Ratio < 1 = small bounce.
+    Spring width_ = Spring::make(330.0f, 0.80f, 0.05f);
+    Spring height_ = Spring::make(330.0f, 0.80f, 0.05f);
+    // Fades and the tab dot: no overshoot, fine settle threshold.
+    Spring hover_ = Spring::make(300.0f, 1.0f, 0.002f);
+    Spring tabIndicator_ = Spring::make(420.0f, 0.86f, 0.002f);
+    Spring contentOpacity_ = Spring::make(260.0f, 1.0f, 0.002f);
     IslandTab activeTab_ = IslandTab::Media;
     int calendarYear_ = 2026;
     int calendarMonth_ = 1;
     int calendarSelectedDay_ = 1;
     int wheelAccumulator_ = 0;
-    std::chrono::steady_clock::time_point lastFrame_ = std::chrono::steady_clock::now();
+
+    VsyncClock vsync_;
+    ComPtr<IDXGIAdapter> adapter_;
+    HMONITOR vsyncMonitor_ = nullptr;
+    int64_t lastFrameVblank_ = 0;
+    bool animating_ = false;
+    bool visualizerActive_ = false;
+    float visualizerElapsed_ = 0.0f;
+    // Visualizer color picked from the album cover, and the color it is
+    // fading toward after a song change.
+    D2D1_COLOR_F albumColor_{};
+    D2D1_COLOR_F albumColorTarget_{};
+    bool hasAlbumColor_ = false;
+    RECT animationRegion_{};
+    bool animationRegionSet_ = false;
 
     SpotifyAudioSession spotifyAudioSession_;
     SpotifySpectrumCapture spotifySpectrumCapture_;
@@ -3859,6 +4463,9 @@ private:
     ComPtr<IDWriteTextFormat> tabFormat_;
     ComPtr<IDWriteTextFormat> temperatureFormat_;
     ComPtr<IDWriteTextFormat> weatherHeroFormat_;
+    ComPtr<IDWriteTextFormat> weatherTempFormat_;
+    ComPtr<IDWriteTextFormat> hourLabelFormat_;
+    ComPtr<IDWriteTextFormat> hourTempFormat_;
     ComPtr<IDWriteTextFormat> dateNumberFormat_;
     ComPtr<IDCompositionDevice> compositionDevice_;
     ComPtr<IDCompositionTarget> compositionTarget_;
@@ -3921,6 +4528,9 @@ LRESULT CALLBACK windowProcedure(HWND window, UINT message, WPARAM wParam, LPARA
     }
     case WM_TIMER:
         if (app) app->onTimer(wParam);
+        return 0;
+    case kFrameTick:
+        if (app) app->onFrameTick();
         return 0;
     case kMediaChanged:
         if (app) app->onMediaChanged();
